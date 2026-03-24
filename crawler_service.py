@@ -2,15 +2,25 @@ import asyncio
 import threading
 import traceback
 from urllib.parse import urljoin, urldefrag, urlparse
+import logging
 
 import aiohttp
 import aiosqlite
 
 from database import DB_PATH, init_db
 
+logger = logging.getLogger("CrawlerLogger")
+logger.setLevel(logging.INFO)
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler = logging.FileHandler("crawler_requests.log", encoding="utf-8")
+file_handler.setFormatter(log_formatter)
+if not logger.handlers:
+    logger.addHandler(file_handler)
+
+
 
 class CrawlerService:
-    def __init__(self, worker_count: int = 30, queue_maxsize: int = 1000):
+    def __init__(self, worker_count: int = 15, queue_maxsize: int = 1000):
         self.loop = None
         self.thread = None
         self.stop_event = None
@@ -33,6 +43,32 @@ class CrawlerService:
 
         # In-memory set for quick duplicate URL filtering (per-job only)
         self.seen_urls = set()
+
+    def _write_report(self, url: str, links: list):
+        import datetime
+        now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        lines = [f"[{now}] {url} crawl için verildi, bunun içinde {len(links)} link tespit edildi."]
+        for i, link in enumerate(links, 1):
+            lines.append(f"  link{i}: {link} -> bunun crawlı sıraya eklendi")
+        lines.append("-" * 60)
+        try:
+            with open("crawl_report.txt", "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
+
+    def _write_report_error(self, url: str, error_msg: str):
+        import datetime
+        now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        lines = [
+            f"[{now}] {url} crawl için verildi fakat hata alındı: {error_msg}",
+            "-" * 60
+        ]
+        try:
+            with open("crawl_report.txt", "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
 
     def start_background_loop(self):
         if self.thread and self.thread.is_alive():
@@ -70,6 +106,7 @@ class CrawlerService:
             try:
                 f.result()
             except Exception as e:
+                logger.error(f"[Background crawler error] {e}")
                 print(f"[Background crawler error] {e}", flush=True)
             finally:
                 with self.state_lock:
@@ -141,9 +178,13 @@ class CrawlerService:
                     VALUES (?, ?, ?, 'pending')
                 """, (origin_url, origin_url, 0))
                 await self.db.commit()
-            print(f"[Crawler] Starting crawl: {origin_url} (depth={max_depth})", flush=True)
+            msg = f"Starting crawl: {origin_url} (depth={max_depth})"
+            logger.info(msg)
+            print(f"[Crawler] {msg}", flush=True)
         else:
-            print("[Crawler] Resuming crawl from saved queue...", flush=True)
+            msg = "Resuming crawl from saved queue..."
+            logger.info(msg)
+            print(f"[Crawler] {msg}", flush=True)
             # Reset any items that were left in 'processing' state during an ungraceful shutdown
             async with self.db_lock:
                 await self.db.execute("UPDATE Queue SET state='pending' WHERE state='processing'")
@@ -208,7 +249,10 @@ class CrawlerService:
 
         self.workers = []
         self.seen_urls.clear()
-        print("[Crawler] Crawl job finished.", flush=True)
+        
+        msg = "Crawl job finished."
+        logger.info(msg)
+        print(f"[Crawler] {msg}", flush=True)
 
     async def _claim_batch_pending(self, batch_size: int = 100):
         """Claim up to batch_size pending items in a single DB transaction."""
@@ -235,6 +279,7 @@ class CrawlerService:
                 await self.db.commit()
                 return rows
         except Exception as e:
+            logger.error(f"Error claiming batch: {e}")
             print(f"[Crawler] Error claiming batch: {e}", flush=True)
             return []
 
@@ -249,6 +294,7 @@ class CrawlerService:
             try:
                 await self._process_url(qid, url, root_origin, depth, max_depth)
             except Exception as e:
+                logger.error(f"Worker-{worker_id} - Error processing {url}: {e}")
                 print(f"[Worker-{worker_id}] Error processing {url}: {e}", flush=True)
                 traceback.print_exc()
                 await self._mark_done(qid)
@@ -261,25 +307,40 @@ class CrawlerService:
             await self._mark_done(qid)
             return
 
-        # Fetch HTML with up to 3 retries (to handle Wikipedia rate-limits/timeouts)
+        # Fetch HTML with up to 4 retries (to handle Wikipedia rate-limits/timeouts)
         html = None
-        for attempt in range(3):
+        last_error = "Bilinmeyen hata veya sayfa boş"
+        import random
+        for attempt in range(4):
             try:
+                # Eş zamanlı saldıran işçileri dağıtarak bot korumasına takılmayı önler
+                await asyncio.sleep(random.uniform(0.2, 0.5))
                 async with self.http_session.get(url, allow_redirects=True) as resp:
                     if resp.status == 429:
-                        await asyncio.sleep(1 + attempt)
+                        last_error = "HTTP 429 Too Many Requests"
+                        # Eğer sunucu 'Şu kadar saniye bekle' diyorsa (Retry-After), ona uyar. Demiyorsa katlanarak bekler.
+                        retry_after = int(resp.headers.get("Retry-After", 2 + attempt * 2))
+                        await asyncio.sleep(retry_after)
                         continue
                     ctype = resp.headers.get("Content-Type", "")
                     if resp.status == 200 and "text/html" in ctype:
                         html = await resp.text(errors="ignore")
+                        last_error = None
+                    else:
+                        last_error = f"HTTP Status: {resp.status}, Content-Type: {ctype}"
                     break
-            except (asyncio.TimeoutError, aiohttp.ClientError):
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                last_error = f"Ağ Hatası: {type(e).__name__}"
                 await asyncio.sleep(1)
             except Exception as e:
+                last_error = f"Beklenmeyen Hata: {str(e)}"
+                logger.error(f"HTTP error for {url}: {e}")
                 print(f"[Crawler] HTTP error for {url}: {e}", flush=True)
                 break
 
         if not html:
+            logger.warning(f"Skipping {url} - Reason: {last_error if last_error else 'No HTML content'}")
+            self._write_report_error(url, last_error if last_error else "Sayfa çekilemedi")
             await self._mark_done(qid)
             return
 
@@ -365,6 +426,8 @@ class CrawlerService:
 
             await self.db.execute("UPDATE Queue SET state='done' WHERE id=?", (qid,))
             await self.db.commit()
+            logger.info(f"Successfully processed and recorded: {url}")
+            self._write_report(url, [cl[0] for cl in child_links])
 
     async def _mark_done(self, qid: int):
         async with self.db_lock:

@@ -1,2 +1,4 @@
 aiohttp==3.9.3
 aiosqlite==0.20.0
+fastapi
+uvicorn

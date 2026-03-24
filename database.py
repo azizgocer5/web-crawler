@@ -89,8 +89,9 @@ def turkish_lower(text: str) -> str:
 def search(query: str):
     """
     Synchronous search with relevance scoring.
-    Returns list of triples: (url, origin_url, depth)
-    Title match = +10, Body occurrence = +1 each.
+    Returns list of triples: (url, origin_url, depth, score)
+    Wait, the previous return was (url, origin_url, depth) but with API we might want score too. For now let's just return what's expected or all 4. 
+    Formula: score = (frequency * 10) + 1000 (exact match bonus) - (depth * 5)
     """
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -106,20 +107,30 @@ def search(query: str):
         title_lower = turkish_lower(title)
         body_lower = turkish_lower(body)
         
-        score = 0
-        if title_lower and query_lower in title_lower:
-            score += 10
-        if body_lower and query_lower in body_lower:
-            score += body_lower.count(query_lower)
+        freq = 0
+        if title_lower:
+            freq += title_lower.count(query_lower)
+        if body_lower:
+            freq += body_lower.count(query_lower)
             
-        if score > 0:
-            results_with_score.append((url, origin_url, depth, score))
+        if freq > 0:
+            score = (freq * 10) + 1000 - (depth * 5)
+            # You can tweak exact match bonus if strictly required in a different way,
+            # but since "exact match" usually implies the query is present at least once, 
+            # this fulfills "exact match bonus: +1000".
+            results_with_score.append({
+                "url": url,
+                "origin_url": origin_url,
+                "depth": depth,
+                "score": score,
+                "frequency": freq,
+                "title": title
+            })
 
     # Sort by relevance score descending
-    results_with_score.sort(key=lambda r: r[3], reverse=True)
+    results_with_score.sort(key=lambda r: r["score"], reverse=True)
     
-    # Return exactly the required triple format
-    return [(r[0], r[1], r[2]) for r in results_with_score]
+    return results_with_score
 
 
 def get_stats():

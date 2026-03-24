@@ -1,9 +1,15 @@
+import sys
+import subprocess
 from crawler_service import CrawlerService
 from database import get_stats, run_init_db, search, set_setting, get_setting
 
 
 def main():
-    crawler = CrawlerService(worker_count=30, queue_maxsize=1000)
+    # Start the API server in the background using the same Python executable
+    api_process = subprocess.Popen([sys.executable, "api.py"])
+    print("[Sistem] API Sunucusu arka planda başlatıldı (Port: 3600).")
+
+    crawler = CrawlerService(worker_count=15, queue_maxsize=1000)
     crawler.start_background_loop()
     run_init_db()
 
@@ -48,9 +54,9 @@ def main():
                     print("Sonuç bulunamadı.")
                 else:
                     print(f"\nSonuçlar ({len(results)} adet):")
-                    for i, (url, origin_url, depth) in enumerate(results[:20], 1):
-                        print(f"  {i}. URL: {url}")
-                        print(f"     Origin: {origin_url} | Depth: {depth}")
+                    for i, r in enumerate(results[:20], 1):
+                        print(f"  {i}. URL: {r['url']}")
+                        print(f"     Origin: {r['origin_url']} | Depth: {r['depth']} | Score: {r['score']}")
 
             elif secim == "4":
                 pages_count, pending_count, processing_count, backpressure = get_stats()
@@ -69,6 +75,8 @@ def main():
 
     finally:
         crawler.shutdown()
+        # Terminate the API server when the main script exists
+        api_process.terminate()
 
 
 if __name__ == "__main__":
